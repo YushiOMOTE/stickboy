@@ -8,6 +8,5 @@ edition = "2018"
 uefi = { path = "uefi-rs" }
 uefi-services = { path = "uefi-rs/uefi-services" }
 uefi-exts = { path = "uefi-rs/uefi-exts" }
-
 log = { version = "0.4", default-features = false }
 librgboy = { path = "../gbr/librgboy" }

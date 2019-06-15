@@ -1,4 +1,4 @@
-use alloc::boxed::Box;
+use alloc::{boxed::Box, vec, vec::Vec};
 use librgboy::hardware::{
     Hardware as GbHardware, Key as GbKey, SoundId, Stream, VRAM_HEIGHT, VRAM_WIDTH,
 };
@@ -6,7 +6,7 @@ use log::*;
 use uefi::{
     prelude::*,
     proto::console::{
-        gop::{BltOp, BltPixel, GraphicsOutput},
+        gop::{BltOp, BltPixel, BltRegion, GraphicsOutput},
         text::{Key, ScanCode},
     },
 };
@@ -21,6 +21,9 @@ struct Hardware {
     st: SystemTable<Boot>,
     vramsz: (usize, usize),
     vram: [u32; VRAM_HEIGHT * VRAM_WIDTH],
+    vramlast: u64,
+    vramscale: usize,
+    keylast: u64,
     pressed: Option<KeyInfo>,
 }
 
@@ -45,12 +48,22 @@ impl Drop for Hardware {
     }
 }
 
+fn pix(col: u32) -> BltPixel {
+    let r = (col >> 16) as u8;
+    let g = (col >> 8) as u8;
+    let b = col as u8;
+    BltPixel::new(r, g, b)
+}
+
 impl Hardware {
     fn new(st: SystemTable<Boot>) -> Self {
         Self {
             st,
             vramsz: (0, 0),
             vram: [0; VRAM_HEIGHT * VRAM_WIDTH],
+            vramlast: 0,
+            vramscale: 1,
+            keylast: 0,
             pressed: None,
         }
     }
@@ -65,11 +78,15 @@ impl Hardware {
         unsafe { &mut *gop.get() }
     }
 
-    fn setup(&self) {
+    fn setup(&mut self) {
         let mode = self
             .gop()
             .modes()
             .map(|mode| mode.expect("Couldn't get graphics mode"))
+            // .find(|ref mode| {
+            //     let info = mode.info();
+            //     info.resolution() == (1024, 768)
+            // })
             .nth(0)
             .expect("No graphics mode");
 
@@ -79,7 +96,44 @@ impl Hardware {
 
         info!("{:?}", self.gop().current_mode_info().resolution());
 
+        let xscale = self.gop().current_mode_info().resolution().0 / VRAM_WIDTH;
+        let yscale = self.gop().current_mode_info().resolution().1 / VRAM_HEIGHT;
+        self.vramscale = xscale.min(yscale).max(1);
+
         self.clear();
+    }
+
+    fn update_vram(&self) {
+        let scale = 1; //self.vramscale;
+
+        let w = VRAM_WIDTH;
+        let h = VRAM_HEIGHT;
+
+        for vramy in 0..scale {
+            for vramx in 0..scale {
+                let xbase = vramx * w;
+                let ybase = vramy * h;
+
+                let subvram: Vec<_> = (0..(w * h))
+                    .map(|i| {
+                        let x = ((i % w) + xbase) / scale;
+                        let y = ((i / w) + ybase) / scale;
+                        pix(self.vram[y * w + x])
+                    })
+                    .chain((0..w).map(|_| pix(0)))
+                    .collect();
+
+                let op = BltOp::BufferToVideo {
+                    buffer: &subvram,
+                    src: BltRegion::Full,
+                    dest: (xbase, ybase),
+                    dims: (w, h),
+                };
+                self.gop()
+                    .blt(op)
+                    .expect_success("Failed to fill screen with color");
+            }
+        }
     }
 
     fn clear(&self) {
@@ -88,43 +142,10 @@ impl Hardware {
             dest: (0, 0),
             dims: self.gop().current_mode_info().resolution(),
         };
+
         self.gop()
             .blt(op)
             .expect_success("Failed to fill screen with color");
-    }
-
-    fn set_pixel(&mut self, x: usize, y: usize, col: u32) {
-        let stride = self.gop().current_mode_info().stride();
-        let pixel_index = (y * stride) + x;
-        let pixel_base = 4 * pixel_index;
-
-        let r = ((col >> 16) & 0xff) as u8;
-        let g = ((col >> 8) & 0xff) as u8;
-        let b = (col & 0xff) as u8;
-
-        unsafe {
-            self.gop()
-                .frame_buffer()
-                .write_value(pixel_base, BltPixel::new(r, g, b));
-        }
-    }
-
-    fn set_pixel8(&mut self, x: usize, y: usize, col: u32) {
-        let (cw, ch) = (64, 32);
-        let (w, h) = self.gop().current_mode_info().resolution();
-        let rx = (w / cw) / 2;
-        let ry = (h / ch) / 2;
-
-        let xs = (w - cw * rx) / 2;
-        let ys = (h - ch * ry) / 2;
-
-        let xb = x * rx;
-        let yb = y * ry;
-        for yo in 0..ry {
-            for xo in 0..rx {
-                self.set_pixel(xb + xo + xs, yb + yo + ys, col);
-            }
-        }
     }
 
     fn get_key(&mut self) -> Option<Key> {
@@ -140,7 +161,7 @@ impl GbHardware for Hardware {
 
     fn vram_update(&mut self, line: usize, buffer: &[u32]) {
         for x in 0..buffer.len() {
-            self.set_pixel(x, line, buffer[x]);
+            self.vram[VRAM_WIDTH * line + x] = buffer[x];
         }
     }
 
@@ -164,7 +185,7 @@ impl GbHardware for Hardware {
                 + (t.second() as u64) * 1000_000
                 + (t.nanosecond() / 1000) as u64
         } else {
-            tsc() / 2
+            tsc() / 1000
         }
     }
 
@@ -175,28 +196,35 @@ impl GbHardware for Hardware {
     }
 
     fn sched(&mut self) -> bool {
-        match self.get_key() {
-            Some(Key::Special(ScanCode::ESCAPE)) => return false,
-            Some(Key::Printable(code)) => {
-                self.pressed = Some(KeyInfo {
-                    key: code.into(),
-                    time: self.clock(),
-                });
-                debug!("pressed {}", self.pressed.as_ref().unwrap().key);
-            }
-            _ => {
-                let clk = self.clock();
+        if self.clock() - self.keylast >= 20_000 {
+            self.keylast = self.clock();
 
-                if let Some(k) = self.pressed.as_ref() {
-                    if clk.wrapping_sub(k.time) > 200_000_000 {
-                        self.pressed = None;
-                        debug!("released");
+            match self.get_key() {
+                Some(Key::Special(ScanCode::ESCAPE)) => return false,
+                Some(Key::Printable(code)) => {
+                    self.pressed = Some(KeyInfo {
+                        key: code.into(),
+                        time: self.clock(),
+                    });
+                    debug!("pressed {}", self.pressed.as_ref().unwrap().key);
+                }
+                _ => {
+                    let clk = self.clock();
+
+                    if let Some(k) = self.pressed.as_ref() {
+                        if clk.wrapping_sub(k.time) > 200_000_000 {
+                            self.pressed = None;
+                            debug!("released");
+                        }
                     }
                 }
             }
         }
 
-        self.st.boot_services().stall(1000_000 / 600);
+        if self.clock() - self.vramlast >= 50_000 {
+            self.vramlast = self.clock();
+            self.update_vram();
+        }
 
         true
     }
@@ -213,7 +241,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 pub fn run(st: SystemTable<Boot>) -> ! {
-    let hw = Hardware::new(st);
+    let mut hw = Hardware::new(st);
 
     hw.setup();
 
