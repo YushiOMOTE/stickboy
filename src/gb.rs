@@ -1,8 +1,6 @@
 use alloc::{boxed::Box, vec, vec::Vec};
-use librgboy::hardware::{
-    Hardware as GbHardware, Key as GbKey, SoundId, Stream, VRAM_HEIGHT, VRAM_WIDTH,
-};
 use log::*;
+use rgy::hardware::{Hardware as GbHardware, Key as GbKey, Stream, VRAM_HEIGHT, VRAM_WIDTH};
 use uefi::{
     prelude::*,
     proto::console::{
@@ -165,9 +163,13 @@ impl GbHardware for Hardware {
         }
     }
 
-    fn sound_play(&mut self, id: SoundId, stream: Box<Stream>) {}
+    fn sound_play(&mut self, stream: Box<dyn Stream>) {}
 
-    fn sound_stop(&mut self, id: SoundId) {}
+    fn load_ram(&mut self, size: usize) -> Vec<u8> {
+        vec![9; size]
+    }
+
+    fn save_ram(&mut self, ram: &[u8]) {}
 
     fn clock(&mut self) -> u64 {
         if cfg!(features = "uefi_time_source") {
@@ -245,8 +247,8 @@ pub fn run(st: SystemTable<Boot>) -> ! {
 
     hw.setup();
 
-    librgboy::run(
-        librgboy::Config::new().native_speed(true),
+    rgy::run(
+        rgy::Config::new().native_speed(true),
         include_bytes!("roms/zelda.gb").to_vec(),
         hw,
     );
